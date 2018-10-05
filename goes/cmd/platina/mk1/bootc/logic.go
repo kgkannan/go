@@ -1,4 +1,3 @@
-// Copyright © 2015-2018 Platina Systems, Inc. All rights reserved.
 // Use of this source code is governed by the GPL-2 license described in the
 // LICENSE file.
 
@@ -34,7 +33,7 @@ import (
 const (
 	minCoreVer   = 0.41
 	minCoreCom   = 299
-	verNum       = "1.12"
+	verNum       = "1.13"
 	goesBootCfg  = "/mountd/sda1/bootc.cfg"
 	sda1Cfg      = "/bootc.cfg"
 	sda6Cfg      = "/sda1/bootc.cfg"
@@ -65,7 +64,9 @@ const (
 
 var BootcCfgFile string
 var uuid1 string
+var uuid1w string
 var uuid6 string
+var uuid6w string
 var kexec0 string
 var kexec1 string
 var kexec6 string
@@ -100,10 +101,17 @@ func Bootc() []string {
 		mounts := string(m)
 		if err := readCfg(); err != nil {
 			continue
+		} else {
+			if err := writeCfg(); err != nil { // updates bootc format
+				fmt.Println("Error: writing bootc.cfg, drop into grub...\n")
+				return []string{""}
+			}
 		}
 		if Cfg.Disable {
 			return []string{""}
 		}
+
+		fixSda1Swap()
 
 		if err := fixNewroot(); err != nil {
 			fmt.Println("Error: can't fix newroot, drop into grub...")
@@ -215,7 +223,8 @@ func Bootc() []string {
 		}
 
 		// sda6 normal
-		if Cfg.BootSda6Cnt > 0 && strings.Contains(parts, sda6) && strings.Contains(mounts, sda6) {
+		if (Cfg.BootSda6Cnt > 0 || !sda6cntEnb) &&
+			strings.Contains(parts, sda6) && strings.Contains(mounts, sda6) {
 			if err := fixPaths(); err != nil {
 				fmt.Println("Error: can't fix paths, drop into grub...")
 				return []string{""}
@@ -460,7 +469,9 @@ func readCfg() error {
 		return err
 	}
 	if _, err := os.Stat(BootcCfgFile); os.IsNotExist(err) {
-		return err
+		if err = initCfg(); err != nil {
+			return err
+		}
 	}
 	dat, err := ioutil.ReadFile(BootcCfgFile)
 	if err != nil {
@@ -918,26 +929,29 @@ func SetSda6I(x string) error {
 
 func UpdateBootcCfg(k, i string) error {
 	k = cbSda6 + "boot/" + k
-	err := SetSda6K(k)
-	if err != nil {
+	if err := SetSda6K(k); err != nil {
 		return err
 	}
 	i = cbSda6 + "boot/" + i
-	err = SetSda6I(i)
-	if err != nil {
+	if err := SetSda6I(i); err != nil {
 		return err
 	}
 	return nil
 }
 
-func Wipe() error {
+func Wipe(dryrun bool) error {
+	if dryrun {
+		fmt.Println("Start wipe dryrun.  Does not write to disk.")
+	}
 	fmt.Println("Making sure we booted from sda1 or sda6...")
 	context, err := getContext()
 	if context != sda6 && context != sda1 {
 		return fmt.Errorf("Not booted from sda6 or sda1, can't wipe.")
 	}
-	if err := clrInstall(); err != nil {
-		return err
+	if !dryrun {
+		if err := clrInstall(); err != nil {
+			return err
+		}
 	}
 
 	fmt.Println("Making sure sda6 exists...")
@@ -990,46 +1004,55 @@ func Wipe() error {
 	if v < minCoreVer {
 		return fmt.Errorf("Coreboot needs upgraded.")
 	}
-	if w < minCoreCom {
+	if v == minCoreVer && w < minCoreCom {
 		return fmt.Errorf("Coreboot needs upgraded.")
 	}
 	fmt.Printf("Coreboot version ok, ver = %d, subver = %d\n", v, w)
 
-	fmt.Println("Deleting sda6 from the partition table...")
-	d1 = []byte("#!/bin/bash\necho -e " + `"d\n6\nw\n"` + " | /sbin/fdisk /dev/sda\n")
-	if err = ioutil.WriteFile(tmpFile, d1, 0755); err != nil {
-		return err
-	}
-	cmd = exec.Command(tmpFile)
-	out, err = cmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("fdisk: %v, %v\n", out, err)
-	}
-
-	fmt.Println("Verify sda6 is actually gone...")
-	d1 = []byte("#!/bin/bash\necho -e " + `"p\nq\n"` + " | /sbin/fdisk /dev/sda\n")
-	if err = ioutil.WriteFile(tmpFile, d1, 0755); err != nil {
-		return err
-	}
-	cmd = exec.Command(tmpFile)
-	out, err = cmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("fdisk: %v, %v\n", out, err)
-		return err
-	}
-	outs = strings.Split(string(out), "\n")
-	for _, m := range outs {
-		if strings.Contains(m, devSda6) {
-			return fmt.Errorf("Error: /dev/sda6 not deleted, aborting wipe")
+	if !dryrun {
+		fmt.Println("Deleting sda6 from the partition table...")
+		d1 = []byte("#!/bin/bash\necho -e " + `"d\n6\nw\n"` + " | /sbin/fdisk /dev/sda\n")
+		if err = ioutil.WriteFile(tmpFile, d1, 0755); err != nil {
+			return err
+		}
+		cmd = exec.Command(tmpFile)
+		out, err = cmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("fdisk: %v, %v\n", out, err)
 		}
 	}
-	fmt.Println("Verified")
 
-	fmt.Println("Setting Install bit for coreboot...")
-	if err := setInstall(); err != nil {
-		return err
+	if !dryrun {
+		fmt.Println("Verify sda6 is actually gone...")
+		d1 = []byte("#!/bin/bash\necho -e " + `"p\nq\n"` + " | /sbin/fdisk /dev/sda\n")
+		if err = ioutil.WriteFile(tmpFile, d1, 0755); err != nil {
+			return err
+		}
+		cmd = exec.Command(tmpFile)
+		out, err = cmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("fdisk: %v, %v\n", out, err)
+			return err
+		}
+		outs = strings.Split(string(out), "\n")
+		for _, m := range outs {
+			if strings.Contains(m, devSda6) {
+				return fmt.Errorf("Error: /dev/sda6 not deleted, aborting wipe")
+			}
+		}
+		fmt.Println("Verified")
 	}
 
+	if !dryrun {
+		fmt.Println("Setting Install bit for coreboot...")
+		if err := setInstall(); err != nil {
+			return err
+		}
+	}
+
+	if dryrun {
+		fmt.Println("Wipe dryrun passed...")
+	}
 	return nil
 }
 
@@ -1147,4 +1170,79 @@ func getCorebootInfo() (im IMGINFO, err error) {
 	}
 	im.Size = fmt.Sprintf("%d", fi.Size())
 	return im, nil
+}
+
+func fixSda1Swap() error {
+	context, err := getContext()
+	if err != nil {
+		return fmt.Errorf("ERROR: cound not detemine context.")
+	}
+	if context != goesBoot {
+		return nil
+	}
+
+	if _, err := os.Stat(cbSda6 + "etc/fstab"); os.IsNotExist(err) {
+		fmt.Println("ERROR:	file", cbSda6+"etc/fstab", "does not exist")
+		return nil
+	}
+	d6, err := ioutil.ReadFile(cbSda6 + "etc/fstab")
+	if err != nil {
+		return err
+	}
+	ds6 := strings.Split(string(d6), "\n")
+
+	if _, err := os.Stat(cbSda1 + "etc/fstab"); os.IsNotExist(err) {
+		fmt.Println("ERROR:	file", cbSda1+"etc/fstab", "does not exist")
+		return fmt.Errorf("ERROR: cound not read sda1 /etc/fstab.")
+	}
+	d1, err := ioutil.ReadFile(cbSda1 + "etc/fstab")
+	if err != nil {
+		return err
+	}
+	ds1 := strings.Split(string(d1), "\n")
+	uuid6 = ""
+	uuid6w = ""
+	for _, j := range ds6 {
+		if strings.Contains(j, "swap") {
+			if strings.Contains(j, "UUID") {
+				k := strings.Split(j, " ")
+				kk := strings.Split(k[0], "=")
+				uuid6 = kk[1]
+				uuid6w = j
+			}
+		}
+	}
+	uuid1 = ""
+	uuid1w = ""
+	for _, j := range ds1 {
+		if strings.Contains(j, "swap") {
+			if strings.Contains(j, "UUID") {
+				k := strings.Split(j, " ")
+				kk := strings.Split(k[0], "=")
+				uuid1 = kk[1]
+				uuid1w = j
+			}
+		}
+	}
+	if uuid1 == "" || uuid6 == "" {
+		fmt.Println("Error: no uuids")
+		return fmt.Errorf("ERROR: no UUID for swap in /etc/fstab.")
+	}
+	if uuid6 == uuid1 {
+		return nil
+	}
+	for i, j := range ds1 {
+		if strings.Contains(j, "swap") {
+			if strings.Contains(j, "UUID") {
+				ds1[i] = uuid6w
+			}
+		}
+	}
+	mm := strings.Join(ds1, "\n")
+	m := []byte(mm)
+	err = ioutil.WriteFile(cbSda1+"etc/fstab", m, 0644)
+	if err != nil {
+		return err
+	}
+	return nil
 }

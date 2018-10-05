@@ -12,6 +12,7 @@ import (
 	"github.com/platinasystems/go/internal/netlink"
 	"github.com/platinasystems/go/vnet"
 	"github.com/platinasystems/go/vnet/ethernet"
+	"github.com/platinasystems/xeth"
 
 	"bytes"
 	"errors"
@@ -428,6 +429,7 @@ type add_del_namespace_event struct {
 	time_start time.Time
 }
 
+//used by fdb
 func (m *net_namespace_main) add_del_namespace(e *add_del_namespace_event) (err error) {
 	name := e.dir.namespace_name(e.file_name)
 
@@ -647,7 +649,7 @@ func (ns *net_namespace) add_del_interface(m *Main, msg *netlink.IfInfoMessage) 
 	return
 }
 
-func (ns *net_namespace) addDelMk1Interface(m *Main, isDel bool, ifname string, ifindex uint32, address [6]byte) (err error) {
+func (ns *net_namespace) addDelMk1Interface(m *Main, isDel bool, ifname string, ifindex uint32, address [6]byte, devtype uint8, iflinkindex int32, vlanid uint16) (err error) {
 	if !isDel {
 		if ns.interface_by_index == nil {
 			ns.interface_by_index = make(map[uint32]*net_namespace_interface)
@@ -660,7 +662,7 @@ func (ns *net_namespace) addDelMk1Interface(m *Main, isDel bool, ifname string, 
 				namespace: ns,
 				name:      ifname,
 				ifindex:   ifindex,
-				kind:      0, // FIXME - how to do L3 vlans?
+				kind:      netlink.InterfaceKindVlan, // either front-panel or linux vlan
 				si:        vnet.SiNil,
 			}
 			ns.interface_by_index[ifindex] = intf
@@ -701,8 +703,8 @@ func (ns *net_namespace) addDelMk1Interface(m *Main, isDel bool, ifname string, 
 
 		}
 
-		if !exists && intf.kind == netlink.InterfaceKindVlan {
-			// FIXME err = m.add_del_vlan(intf, msg, is_del)
+		if !exists && devtype == xeth.XETH_DEVTYPE_LINUX_VLAN {
+			m.addDelVlan(intf, iflinkindex, vlanid, isDel)
 		}
 	} else {
 		intf, ok := ns.interface_by_index[ifindex]
@@ -712,8 +714,8 @@ func (ns *net_namespace) addDelMk1Interface(m *Main, isDel bool, ifname string, 
 		}
 
 		if intf.si != vnet.SiNil {
-			if intf.kind == netlink.InterfaceKindVlan {
-				// FIXME m.add_del_vlan(intf, msg, isDel)
+			if devtype == xeth.XETH_DEVTYPE_LINUX_VLAN {
+				m.addDelVlan(intf, iflinkindex, vlanid, isDel)
 			}
 			ns.si_by_ifindex.unset(ifindex)
 			delete(m.interface_by_si, intf.si)
@@ -779,6 +781,54 @@ func (m *net_namespace_main) add_del_vlan(intf *net_namespace_interface, msg *ne
 			} else {
 				eid.Set(id)
 			}
+		} else {
+			eid.Set(id)
+		}
+		hi := v.SupHi(sup_si)
+		hw := v.HwIf(hi)
+		si := ns.m.m.v.NewSwSubInterface(hw.Si(), vnet.IfId(eid))
+		m.set_si(intf, si)
+	}
+	return
+}
+
+//this is used in fdb mode
+func (m *net_namespace_main) addDelVlan(intf *net_namespace_interface, supifindex int32, vlanid uint16, isDel bool) (err error) {
+
+	if IfinfoDebug {
+		fmt.Println("addDelVlan():", supifindex, vlanid, isDel)
+	}
+	ns := intf.namespace
+	sup_index := uint32(supifindex)
+	sup_si := vnet.SiNil
+
+	// Look in same namespace as target interface; if not found look in all namespaces (ifindex had better be unique!).
+	sup_intf := ns.interface_by_index[sup_index]
+	if sup_intf == nil {
+		sup_intf = m.find_interface_with_ifindex(sup_index)
+	}
+	if sup_intf == nil {
+		err = fmt.Errorf("sup interface not found")
+		return
+	}
+
+	sup_si = sup_intf.si
+	intf.sup_interface = sup_intf
+
+	// Sup interface not Vnet interface?
+	if sup_si == vnet.SiNil {
+		return
+	}
+
+	v := ns.m.m.v
+	if isDel {
+		v.DelSwIf(intf.si)
+	} else {
+		id := vnet.Uint16(vlanid)
+		var eid ethernet.IfId
+		if sup_si.IsSwSubInterface(v) {
+			eid = ethernet.IfId(v.SwIf(sup_si).Id(v))
+			eid.Set(id)
 		} else {
 			eid.Set(id)
 		}
@@ -1109,7 +1159,8 @@ func (ns *net_namespace) is_deleted() bool { return ns.ns_fd < 0 }
 
 func (ns *net_namespace) del(m *net_namespace_main) {
 	for index, intf := range ns.interface_by_index {
-		if intf.si != vnet.SiNil {
+		//do not delete hardware interface; platina-mk1 kernel driver will send seperate message to add it back to default ns
+		if intf.si != vnet.SiNil && intf.si.Kind(m.m.v) != vnet.SwIfKindHardware {
 			m.m.v.DelSwIf(intf.si)
 		}
 		delete(ns.interface_by_index, index)

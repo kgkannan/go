@@ -5,13 +5,14 @@
 package ip4
 
 import (
+	"fmt"
+	"sync"
+
 	"github.com/platinasystems/go/elib"
 	"github.com/platinasystems/go/elib/dep"
 	"github.com/platinasystems/go/elib/parse"
 	"github.com/platinasystems/go/vnet"
 	"github.com/platinasystems/go/vnet/ip"
-
-	"fmt"
 )
 
 type Prefix struct {
@@ -105,26 +106,39 @@ type mapFibResult struct {
 // Maps for prefixes for /0 through /32; key in network byte order.
 type MapFib [1 + 32]map[vnet.Uint32]mapFibResult
 
-// Cache of prefix length network masks: entry LEN has high LEN bits set.
-// So, 10/8 has top 8 bits set.
-var netMasks = computeNetMasks()
-
-func computeNetMasks() (r [33]vnet.Uint32) {
-	for i := range netMasks {
-		m := ^vnet.Uint32(0)
-		if i < 32 {
-			m = vnet.Uint32(1<<uint(i)-1) << uint(32-i)
-		}
-		r[i] = vnet.Uint32(m).FromHost()
+var cached struct {
+	masks struct {
+		once sync.Once
+		val  interface{}
 	}
-	return
 }
 
-func (p *Prefix) Mask() vnet.Uint32          { return netMasks[p.Len] }
+// Cache of prefix length network masks: entry LEN has high LEN bits set.
+// So, 10/8 has top 8 bits set.
+func netMask(i uint) vnet.Uint32 {
+	const nmasks = 33
+	cached.masks.once.Do(func() {
+		masks := make([]vnet.Uint32, nmasks)
+		for i := range masks {
+			m := ^vnet.Uint32(0)
+			if i < 32 {
+				m = vnet.Uint32(1<<uint(i)-1) << uint(32-i)
+			}
+			masks[i] = vnet.Uint32(m).FromHost()
+		}
+		cached.masks.val = masks
+	})
+	if i < nmasks {
+		return cached.masks.val.([]vnet.Uint32)[i]
+	}
+	return 0
+}
+
+func (p *Prefix) Mask() vnet.Uint32          { return netMask(uint(p.Len)) }
 func (p *Prefix) MaskAsAddress() (a Address) { a.FromUint32(p.Mask()); return }
 func (p *Prefix) mapFibKey() vnet.Uint32     { return p.Address.AsUint32() & p.Mask() }
 func (a *Address) Mask(l uint) (v Address) {
-	v.FromUint32(a.AsUint32() & netMasks[l])
+	v.FromUint32(a.AsUint32() & netMask(l))
 	return
 }
 
@@ -738,12 +752,14 @@ func (f *Fib) addDelRouteNextHop(m *Main, p *Prefix, nha Address, nhr NextHopper
 	}
 
 	if oldAdj != newAdj {
-		// Oriniglally only remove from fib on delete of final adjacency, but this caused some fib to never get deleted
-		// Now changed to delete immediately
+		// oldAdj != newAdj means index changed because there is now more than 1 nexthop (multiplath)
+		// or multipath members changed because of nexthop add/del
+
 		isFibDel := isDel
+		// if isDel, do not remove adjacency unless all members of the multipath adjacency have been removed
+		// when that happens newAdj will be ip.AdjNil
 		if isFibDel && newAdj != ip.AdjNil {
-			//isFibDel = false
-			isFibDel = isDel
+			isFibDel = false
 		}
 		f.addDel(m, p, newAdj, isFibDel)
 		nhf.setReachable(m, p, f, &reachable_via_prefix, nha, nhr, isDel)

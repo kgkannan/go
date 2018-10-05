@@ -7,7 +7,7 @@ package tempd
 import (
 	"encoding/hex"
 	"fmt"
-	"os/exec"
+	"io/ioutil"
 	"regexp"
 	"strconv"
 	"strings"
@@ -18,9 +18,13 @@ import (
 	"github.com/platinasystems/go/goes/cmd"
 	"github.com/platinasystems/go/goes/lang"
 	"github.com/platinasystems/go/internal/log"
+	"github.com/platinasystems/go/internal/machine"
 	"github.com/platinasystems/go/internal/redis"
 	"github.com/platinasystems/go/internal/redis/publisher"
-	"github.com/platinasystems/go/internal/machine"
+)
+
+const (
+	hwmon = "/sys/class/hwmon/"
 )
 
 var bmcIpv6LinkLocalRedis string
@@ -134,7 +138,11 @@ func bmcStatus() (string, string) {
 			v = "down"
 		} else {
 			v = "up"
-			bmcIpv4, _ := d.Do("HGET", machine.Name, "eth0.ipv4")
+			var bmcIpv4 interface{}
+			bmcIpv4, err = d.Do("HGET", machine.Name+"-bmc", "eth0.ipv4")
+			if err != nil {
+				bmcIpv4, _ = d.Do("HGET", "platina", "eth0.ipv4") // to support old bmc builds
+			}
 			s := fmt.Sprint(bmcIpv4)
 			if !strings.Contains(s, "ERROR") {
 				r, _ := regexp.Compile("([0-9]+).([0-9]+).([0-9]+).([0-9]+)")
@@ -148,29 +156,17 @@ func bmcStatus() (string, string) {
 }
 
 func cpuCoreTemp() string {
-	var max float64
-	var v string
-	t, err := exec.Command("sensors").Output()
-	if err != nil {
-		return ""
+	hi := float64(0)
+	t, err := readTemp("hwmon0", "core") // assumes lm-sensors
+	if err == nil && t > hi {
+		hi = t
 	}
-	lines := strings.Split(string(t), "\n")
-
-	max = -1000
-	r, _ := regexp.Compile("[\\+,-]([0-9]+).[0-9]")
-	for _, line := range lines {
-		temps := r.FindAllString(line, -1)
-		if temps != nil {
-			f, err := strconv.ParseFloat(temps[0], 64)
-			if err == nil {
-				if f > max {
-					max = f
-				}
-			}
-		}
-		v = strconv.FormatFloat(max, 'f', 1, 64)
+	t, err = readTemp("hwmon1", "lm75") // assumes device is discovered
+	if err == nil && t > hi {
+		hi = t
 	}
-	if v == "-1000" {
+	v := fmt.Sprintf("%.2f\n", hi/1000)
+	if v == "0" {
 		return ""
 	}
 	if bmcIpv6LinkLocalRedis == "" {
@@ -186,9 +182,41 @@ func cpuCoreTemp() string {
 	if bmcIpv6LinkLocalRedis != "" {
 		d, err := redigo.Dial("tcp", bmcIpv6LinkLocalRedis)
 		if err == nil {
-			d.Do("HSET", machine.Name, "host.temp.units.C", v)
+			_, err = d.Do("HSET", machine.Name+"-bmc", "host.temp.units.C", v)
+			if err != nil {
+				d.Do("HSET", "platina", "host.temp.units.C", v) // to support old bmc builds
+			}
 			d.Close()
 		}
 	}
 	return v
+}
+
+func readTemp(dir string, dev string) (h float64, err error) {
+	h = float64(0)
+	n, err := ioutil.ReadFile(hwmon + dir + "/name")
+	if err != nil {
+		return h, err
+	}
+	if strings.Contains(string(n), dev) {
+		l, err := ioutil.ReadDir(hwmon + dir)
+		if err != nil {
+			return h, err
+		}
+		for _, f := range l {
+			if strings.Contains(f.Name(), "_input") {
+				t, err := ioutil.ReadFile(hwmon + dir + "/" + f.Name())
+				if err == nil {
+					tt := strings.Split(string(t), "\n")
+					ttf, err := strconv.ParseFloat(tt[0], 64)
+					if err == nil {
+						if ttf > h {
+							h = ttf
+						}
+					}
+				}
+			}
+		}
+	}
+	return h, nil
 }

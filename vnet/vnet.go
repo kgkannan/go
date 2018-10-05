@@ -12,12 +12,10 @@ import (
 	"github.com/platinasystems/go/elib/dep"
 	"github.com/platinasystems/go/elib/loop"
 	"github.com/platinasystems/go/elib/parse"
-	"github.com/platinasystems/go/internal/xeth"
+	"github.com/platinasystems/xeth"
 )
 
 var LogSvi bool
-
-var Xeth *xeth.Xeth
 
 // drivers/net/ethernet/xeth/platina_mk1.c: xeth.MsgIfinfo
 // PortEntry go/main/goes-platina-mk1/vnetd.go:vnetdInit() xeth.XETH_MSG_KIND_IFINFO
@@ -32,13 +30,14 @@ type PortEntry struct {
 	Ifindex      int32
 	Iflinkindex  int32 // system side eth# ifindex
 	Ifname       string
-	Flags        xeth.EthtoolFlagBits
-	Iff          xeth.Iff
+	Flags        xeth.EthtoolPrivFlags
+	Iff          net.Flags
 	Speed        xeth.Mbps
 	Vid          uint16 // port_vid
 	Portindex    int16
 	Subportindex int8
 	PuntIndex    uint8 // 0-based meth#, derived from Iflinkindex
+	Devtype      uint8
 	Addr         [xeth.ETH_ALEN]uint8
 	IPNets       []*net.IPNet
 }
@@ -90,15 +89,7 @@ func SetBridgeMember(ifname string) *BridgeMemberEntry {
 	return entry
 }
 
-var PortPrefixer interface {
-	Get() string
-	Set(string)
-	Name(portIndex, subPortIndex int) string
-}
-
 func SetPort(ifname string) *PortEntry {
-	PortPrefixer.Set(ifname)
-
 	if Ports == nil {
 		Ports = make(map[string]*PortEntry)
 	}

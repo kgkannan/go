@@ -17,12 +17,12 @@ import (
 	"github.com/platinasystems/go/goes/cmd/vnetd"
 	"github.com/platinasystems/go/internal/machine"
 	"github.com/platinasystems/go/internal/redis"
-	"github.com/platinasystems/go/internal/xeth"
 	"github.com/platinasystems/go/vnet"
 	"github.com/platinasystems/go/vnet/ethernet"
 	"github.com/platinasystems/go/vnet/platforms/fe1"
 	"github.com/platinasystems/go/vnet/platforms/mk1"
 	"github.com/platinasystems/go/vnet/unix"
+	"github.com/platinasystems/xeth"
 
 	"gopkg.in/yaml.v2"
 )
@@ -53,10 +53,9 @@ func vnetdInit() {
 	// FIXME vnet shouldn't be so bursty
 	const nports = 4 * 32
 	const ncounters = 512
-	xeth.EthtoolFlags = flags
-	xeth.EthtoolStats = stats
-	vnet.PortPrefixer = &mk1.PortPrefix
-	vnet.Xeth, err = xeth.New(machine.Name)
+	xeth.EthtoolPrivFlagNames = flags
+	xeth.EthtoolStatNames = stats
+	err = xeth.Start(machine.Name)
 
 	if err != nil {
 		panic(err)
@@ -89,16 +88,17 @@ func vnetdInit() {
 		return false
 	}
 	p := new(mk1Main)
-	vnet.Xeth.DumpIfinfo()
-	err = vnet.Xeth.UntilBreak(func(buf []byte) error {
+	xeth.DumpIfinfo()
+	err = xeth.UntilBreak(func(buf []byte) error {
 		ptr := unsafe.Pointer(&buf[0])
 		switch xeth.KindOf(buf) {
 		case xeth.XETH_MSG_KIND_ETHTOOL_FLAGS:
 			msg := (*xeth.MsgEthtoolFlags)(ptr)
-			ifname := xeth.Ifname(msg.Ifname)
-			entry, found := vnet.Ports[ifname.String()]
+			xethif := xeth.Interface.Indexed(msg.Ifindex)
+			ifname := xethif.Ifinfo.Name
+			entry, found := vnet.Ports[ifname]
 			if found {
-				entry.Flags = xeth.EthtoolFlagBits(msg.Flags)
+				entry.Flags = xeth.EthtoolPrivFlags(msg.Flags)
 			}
 			if vnet.LogSvi {
 				fmt.Printf("XETH_MSG_KIND_ETHTOOL_FLAGS: found:%v %+v\n",
@@ -106,8 +106,9 @@ func vnetdInit() {
 			}
 		case xeth.XETH_MSG_KIND_ETHTOOL_SETTINGS:
 			msg := (*xeth.MsgEthtoolSettings)(ptr)
-			ifname := xeth.Ifname(msg.Ifname)
-			entry, found := vnet.Ports[ifname.String()]
+			xethif := xeth.Interface.Indexed(msg.Ifindex)
+			ifname := xethif.Ifinfo.Name
+			entry, found := vnet.Ports[ifname]
 			if found {
 				entry.Speed = xeth.Mbps(msg.Speed)
 			}
@@ -127,18 +128,24 @@ func vnetdInit() {
 				punt_index = 1
 			}
 
-			ifname := xeth.Ifname(msg.Ifname)
-
 			switch msg.Devtype {
-			case xeth.XETH_DEVTYPE_PORT:
+			case xeth.XETH_DEVTYPE_LINUX_VLAN:
+				fallthrough
+			case xeth.XETH_DEVTYPE_XETH_PORT:
 				err = unix.ProcessInterfaceInfo((*xeth.MsgIfinfo)(ptr), vnet.PreVnetd, nil, punt_index)
-			case xeth.XETH_DEVTYPE_BRIDGE:
+			case xeth.XETH_DEVTYPE_XETH_BRIDGE:
 				be := vnet.SetBridge(msg.Id)
 				be.Ifindex = msg.Ifindex
 				be.Iflinkindex = msg.Iflinkindex
 				be.PuntIndex = punt_index
 				copy(be.Addr[:], msg.Addr[:])
 				be.Net = msg.Net
+			case xeth.XETH_DEVTYPE_LINUX_UNKNOWN:
+				// FIXME
+			}
+			/* FIXME these are deprecated...
+			ifname := xeth.Ifname(msg.Ifname)
+			switch msg.Devtype {
 			case xeth.XETH_DEVTYPE_UNTAGGED_BRIDGE_PORT:
 				brm := vnet.SetBridgeMember(ifname.String())
 				brm.Vid = msg.Id
@@ -150,6 +157,7 @@ func vnetdInit() {
 				brm.IsTagged = true
 				brm.PortVid = uint16(msg.Portid)
 			}
+			*/
 			if vnet.LogSvi {
 				fmt.Printf("XETH_MSG_KIND_IFINFO: %+v\n", *msg)
 			}
@@ -203,6 +211,9 @@ func (p *mk1Main) parsePortConfig() (err error) {
 		// Massage ethtool port-provision format into fe1 format
 		var pp fe1.PortProvision
 		for ifname, entry := range vnet.Ports {
+			if entry.Devtype == xeth.XETH_DEVTYPE_LINUX_VLAN {
+				continue
+			}
 			pp.Name = ifname
 			pp.Portindex = entry.Portindex
 			pp.Subportindex = entry.Subportindex
@@ -368,8 +379,8 @@ func (p *mk1Main) stopHook(i *vnetd.Info, v *vnet.Vnet) error {
 	err = mk1.PlatformExit(v, &p.Platform)
 	fmt.Printf("mk1.PlatformExit (%v)\n", time.Now().Sub(begin))
 	begin = time.Now()
-	vnet.Xeth.Close()
-	fmt.Printf("vnet.Xeth.Close (%v)\n", time.Now().Sub(begin))
+	xeth.Stop()
+	fmt.Printf("xeth.Close (%v)\n", time.Now().Sub(begin))
 	return err
 }
 

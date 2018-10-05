@@ -20,15 +20,20 @@ import (
 	"unsafe"
 
 	"github.com/platinasystems/go/elib/loop"
-	"github.com/platinasystems/go/internal/xeth"
 	"github.com/platinasystems/go/vnet"
 	"github.com/platinasystems/go/vnet/ethernet"
 	"github.com/platinasystems/go/vnet/ip"
 	"github.com/platinasystems/go/vnet/ip4"
+	"github.com/platinasystems/xeth"
 )
 
-var FdbOn bool = false
+// Function flags
+var FdbOn bool = true
 var FdbIfAddrOn bool = true
+
+// Debug flags
+var IfETSettingDebug bool
+var IfETFlagDebug bool
 var IfinfoDebug bool
 var IfaddrDebug bool
 var FibentryDebug bool
@@ -106,10 +111,13 @@ func initVnetFromXeth(v *vnet.Vnet) {
 	// Initiate walk of PortEntry map to send IFAs
 	ProcessInterfaceAddr(nil, vnet.ReadyVnetd, v)
 
+	// Initiate walk of PortEntry map to send vnetd ethtool data
+	InitInterfaceEthtool(v)
+
 	// Send events for initial dump of fib entries
 	fe := fdbm.GetEvent(vnet.Dynamic)
-	vnet.Xeth.DumpFib()
-	for msg := range vnet.Xeth.RxCh {
+	xeth.DumpFib()
+	for msg := range xeth.RxCh {
 		if kind := xeth.KindOf(msg); kind == xeth.XETH_MSG_KIND_BREAK {
 			xeth.Pool.Put(msg)
 			break
@@ -133,7 +141,7 @@ func gofdb(v *vnet.Vnet) {
 	m := GetMain(v)
 	fdbm := &m.FdbMain
 	fe := fdbm.GetEvent(vnet.Dynamic)
-	for msg := range vnet.Xeth.RxCh {
+	for msg := range xeth.RxCh {
 		if ok := fe.EnqueueMsg(msg); !ok {
 			fe.Signal()
 			fe = fdbm.GetEvent(vnet.Dynamic)
@@ -141,7 +149,7 @@ func gofdb(v *vnet.Vnet) {
 				panic("Can't enqueue fdb")
 			}
 		}
-		if len(vnet.Xeth.RxCh) == 0 {
+		if len(xeth.RxCh) == 0 {
 			fe.Signal()
 			fe = fdbm.GetEvent(vnet.Dynamic)
 		}
@@ -172,16 +180,17 @@ func (e *fdbEvent) EventAction() {
 			err = ProcessInterfaceInfo((*xeth.MsgIfinfo)(ptr), e.evType, vn, 0)
 		case xeth.XETH_MSG_KIND_ETHTOOL_FLAGS:
 			msg := (*xeth.MsgEthtoolFlags)(ptr)
-			ifname := xeth.Ifname(msg.Ifname)
-			vnet.SetPort(ifname.String()).Flags =
-				xeth.EthtoolFlagBits(msg.Flags)
-			fec91 := vnet.PortIsFec91(ifname.String())
-			fec74 := vnet.PortIsFec74(ifname.String())
-			if false {
+			xethif := xeth.Interface.Indexed(msg.Ifindex)
+			ifname := xethif.Ifinfo.Name
+			vnet.SetPort(ifname).Flags =
+				xeth.EthtoolPrivFlags(msg.Flags)
+			fec91 := vnet.PortIsFec91(ifname)
+			fec74 := vnet.PortIsFec74(ifname)
+			if IfETFlagDebug {
 				fmt.Printf("XETH_MSG_KIND_ETHTOOL_FLAGS: %s Fec91 %v\n",
-					ifname.String(), fec91)
+					ifname, fec91)
 				fmt.Printf("XETH_MSG_KIND_ETHTOOL_FLAGS: %s Fec74 %v\n",
-					ifname.String(), fec74)
+					ifname, fec74)
 			}
 			var fec ethernet.ErrorCorrectionType
 			// if both fec91 and fec74 are on, set fec to fec91
@@ -193,29 +202,38 @@ func (e *fdbEvent) EventAction() {
 				fec = ethernet.ErrorCorrectionNone
 			}
 			media := "fiber"
-			if vnet.PortIsCopper(ifname.String()) {
+			if vnet.PortIsCopper(ifname) {
 				media = "copper"
 			}
-			hi, found := vn.HwIfByName(ifname.String())
+			if IfETFlagDebug {
+				fmt.Printf("XETH_MSG_KIND_ETHTOOL_FLAGS: %s copper %v\n",
+					ifname, media == "copper")
+			}
+			hi, found := vn.HwIfByName(ifname)
 			if found {
+				if IfETFlagDebug {
+					fmt.Printf("XETH_MSG_KIND_ETHTOOL_FLAGS: Setting media %s fec %v\n", media, fec)
+				}
 				hi.SetMedia(vn, media)
 				err = ethernet.SetInterfaceErrorCorrection(vn, hi, fec)
 				if err != nil {
 					fmt.Printf("XETH_MSG_KIND_ETHTOOL_FLAGS: %s Error setting fec: %v\n",
-						ifname.String(), err)
+						ifname, err)
 				}
 			}
 		case xeth.XETH_MSG_KIND_ETHTOOL_SETTINGS:
 			msg := (*xeth.MsgEthtoolSettings)(ptr)
-			ifname := xeth.Ifname(msg.Ifname)
-			vnet.SetPort(ifname.String()).Speed =
+			xethif := xeth.Interface.Indexed(msg.Ifindex)
+			ifname := xethif.Ifinfo.Name
+			vnet.SetPort(ifname).Speed =
 				xeth.Mbps(msg.Speed)
-			hi, found := vn.HwIfByName(ifname.String())
+			hi, found := vn.HwIfByName(ifname)
 			if found {
 				bw := float64(msg.Speed)
 				speedOk := false
-				if false {
-					fmt.Printf("xeth.XETH_MSG_KIND_ETHTOOL_SETTINGS processing speed %v\n", bw)
+				if IfETSettingDebug {
+					fmt.Printf("xeth.XETH_MSG_KIND_ETHTOOL_SETTINGS processing speed %s %v\n",
+						ifname, bw)
 				}
 				switch bw {
 				case 0, 1000, 10000, 20000, 25000, 40000, 50000, 100000:
@@ -270,7 +288,7 @@ func (ns *net_namespace) parseIP4NextHops(msg *xeth.MsgFibentry) (nhs []ip4_next
 	if FibentryDebug {
 		fmt.Println("parseIP4NextHops: length nhs:", len(xethNhs))
 		for i, _ := range xethNhs {
-			fmt.Printf("parseIP4NextHops: [%d] %s\n", i, xethNhs[i].String())
+			fmt.Printf("parseIP4NextHops[%d]: %#v\n", i, xethNhs[i])
 		}
 	}
 
@@ -281,7 +299,9 @@ func (ns *net_namespace) parseIP4NextHops(msg *xeth.MsgFibentry) (nhs []ip4_next
 	if len(xethNhs) == 1 {
 		nh.intf = ns.interface_by_index[uint32(xethNhs[0].Ifindex)]
 		if nh.intf == nil {
-			fmt.Println("parseIP4NextHops: Can't find ns-intf for ifindex", xethNhs[0].Ifindex)
+			if FibentryDebug {
+				fmt.Println("parseIP4NextHops: Can't find ns-intf for ifindex", xethNhs[0].Ifindex)
+			}
 			return
 		}
 		nh.Si = nh.intf.si
@@ -291,7 +311,9 @@ func (ns *net_namespace) parseIP4NextHops(msg *xeth.MsgFibentry) (nhs []ip4_next
 		for _, xnh := range xethNhs {
 			intf := ns.interface_by_index[uint32(xnh.Ifindex)]
 			if intf == nil {
-				fmt.Println("parseIP4NextHops: Can't find ns-intf for ifindex", xnh.Ifindex)
+				if FibentryDebug {
+					fmt.Println("parseIP4NextHops: Can't find ns-intf for ifindex", xnh.Ifindex)
+				}
 				continue
 			}
 			nh.Si = intf.si
@@ -492,9 +514,10 @@ func ProcessFibEntry(msg *xeth.MsgFibentry, v *vnet.Vnet) (err error) {
 				ProcessZeroGw(msg, v, nil, isDel, isLocal, isMainUc)
 				return
 			}
+
 			if FibentryDebug {
-				fmt.Printf("RouteMsg for Prefix %v adding nexthop %v isDel %v isReplace %v\n",
-					p, nh.Address, isDel, isReplace)
+				fmt.Printf("RouteMsg for ns %s Prefix %v adding nexthop %v isDel %v isReplace %v\n",
+					ns.name, p, nh.Address, isDel, isReplace)
 			}
 			if err = m4.AddDelRouteNextHop(&p, &nh.NextHop, isDel, isReplace); err != nil {
 				fmt.Println("AddDelRouteNextHop: returns err:", err)
@@ -532,29 +555,40 @@ func (ns *net_namespace) Ip4IfaddrMsg(m4 *ip4.Main, ipnet *net.IPNet, ifindex ui
 }
 
 func ProcessInterfaceAddr(msg *xeth.MsgIfa, action vnet.ActionType, v *vnet.Vnet) (err error) {
-
 	if !FdbIfAddrOn {
 		return
 	}
-	var ifname xeth.Ifname
+	if msg == nil {
+		sendFdbEventIfAddr(v)
+		return
+	}
+	xethif := xeth.Interface.Indexed(msg.Ifindex)
+	if xethif == nil {
+		err = fmt.Errorf("can't find %d", msg.Ifindex)
+		return
+	}
+	ifname := xethif.Name
+	if len(ifname) == 0 {
+		err = fmt.Errorf("interface %d has no name", msg.Ifindex)
+		return
+	}
 	switch action {
 	case vnet.PreVnetd:
 		// stash addresses for later use
-		ifname = xeth.Ifname(msg.Ifname)
-		pe := vnet.SetPort(ifname.String())
+		pe := vnet.SetPort(ifname)
 		if IfaddrDebug {
-			fmt.Println("XETH_MSG_KIND_IFA: PreVnetd:", ifname.String())
+			fmt.Println("XETH_MSG_KIND_IFA: PreVnetd:", ifname)
 		}
 		if msg.IsAdd() {
 			if IfaddrDebug {
-				fmt.Println("XETH_MSG_KIND_IFA: PreVnetd Add", ifname.String(), msg.Event, msg.Prefix())
+				fmt.Println("XETH_MSG_KIND_IFA: PreVnetd Add", ifname, msg.Event, msg.IPNet())
 			}
-			pe.AddIPNet(msg.Prefix())
+			pe.AddIPNet(msg.IPNet())
 		} else if msg.IsDel() {
 			if IfaddrDebug {
-				fmt.Println("XETH_MSG_KIND_IFA: PreVnetd Del", ifname.String(), msg.Event, msg.Prefix())
+				fmt.Println("XETH_MSG_KIND_IFA: PreVnetd Del", ifname, msg.Event, msg.IPNet())
 			}
-			pe.DelIPNet(msg.Prefix())
+			pe.DelIPNet(msg.IPNet())
 		}
 	case vnet.ReadyVnetd:
 		// Walk Port map and flush any IFAs we gathered at prevnetd time
@@ -593,29 +627,28 @@ func ProcessInterfaceAddr(msg *xeth.MsgIfa, action vnet.ActionType, v *vnet.Vnet
 			fmt.Println("XETH_MSG_KIND_IFA: Dynamic Add", msg.IsAdd())
 		}
 		// vnetd is up and running and received an event, so call into vnet api
-		ifname = xeth.Ifname(msg.Ifname)
-		pe, found := vnet.Ports[ifname.String()]
+		pe, found := vnet.Ports[ifname]
 		if !found {
 			if IfaddrDebug {
-				fmt.Println("XETH_MSG_KIND_IFA :", ifname.String(), "not found!")
+				fmt.Println("XETH_MSG_KIND_IFA :", ifname, "not found!")
 			}
-			err = fmt.Errorf("Dynamic IFA - Ifname unknown:", ifname.String())
+			err = fmt.Errorf("Dynamic IFA - %q unknown", ifname)
 			return
 		}
 		if FdbOn {
 			if action == vnet.Dynamic {
 				if msg.IsAdd() {
 					if IfaddrDebug {
-						fmt.Println("XETH_MSG_KIND_IFA: Add", ifname.String(),
-							msg.Event, msg.Prefix())
+						fmt.Println("XETH_MSG_KIND_IFA: Add", ifname,
+							msg.Event, msg.IPNet())
 					}
-					pe.AddIPNet(msg.Prefix())
+					pe.AddIPNet(msg.IPNet())
 				} else if msg.IsDel() {
 					if IfaddrDebug {
-						fmt.Println("XETH_MSG_KIND_IFA: Del", ifname.String(),
-							msg.Event, msg.Prefix())
+						fmt.Println("XETH_MSG_KIND_IFA: Del", ifname,
+							msg.Event, msg.IPNet())
 					}
-					pe.DelIPNet(msg.Prefix())
+					pe.DelIPNet(msg.IPNet())
 				}
 			}
 
@@ -626,7 +659,7 @@ func ProcessInterfaceAddr(msg *xeth.MsgIfa, action vnet.ActionType, v *vnet.Vnet
 					fmt.Println("XETH_MSG_KIND_IFA- : Namespace found", pe.Net)
 				}
 				m4 := ip4.GetMain(v)
-				ns.Ip4IfaddrMsg(m4, msg.Prefix(), uint32(pe.Ifindex), msg.IsDel())
+				ns.Ip4IfaddrMsg(m4, msg.IPNet(), uint32(pe.Ifindex), msg.IsDel())
 			} else {
 				if IfaddrDebug {
 					fmt.Println("XETH_MSG_KIND_IFA- : Namespace not found", pe.Net)
@@ -643,23 +676,23 @@ func sendFdbEventIfAddr(v *vnet.Vnet) {
 	fe := fdbm.GetEvent(vnet.PostReadyVnetd)
 
 	for _, pe := range vnet.Ports {
-		var ifname [16]uint8
-		copy(ifname[:], pe.Ifname)
+		xethif := xeth.Interface.Indexed(pe.Ifindex)
+		ifname := xethif.Name
 		if IfaddrDebug {
-			fmt.Println("sendFdbEventIfAddr:", pe.Ifname)
+			fmt.Println("sendFdbEventIfAddr:", ifname)
 		}
 
 		for _, peipnet := range pe.IPNets {
 			buf := xeth.Pool.Get(xeth.SizeofMsgIfa)
 			msg := (*xeth.MsgIfa)(unsafe.Pointer(&buf[0]))
 			msg.Kind = xeth.XETH_MSG_KIND_IFA
-			msg.Ifname = ifname
+			msg.Ifindex = xethif.Index
 			msg.Event = xeth.IFA_ADD
 			msg.Address = ipnetToUint(peipnet, true)
 			msg.Mask = ipnetToUint(peipnet, false)
 			if IfaddrDebug {
-				ifn := xeth.Ifname(msg.Ifname)
-				fmt.Println("sendFdbEventIfAddr:", ifn.String(), msg.Address, msg.Mask)
+				fmt.Printf("sendFdbEventIfAddr: %s %v\n",
+					ifname, msg.IPNet())
 			}
 			ok := fe.EnqueueMsg(buf)
 			if !ok {
@@ -728,28 +761,37 @@ func getNsByInode(m *Main, netNum uint64) *net_namespace {
 	}
 }
 
-func ProcessInterfaceInfo(msg *xeth.MsgIfinfo, action vnet.ActionType, v *vnet.Vnet, puntIndex uint8) (err error) {
+func makePortEntry(msg *xeth.MsgIfinfo, puntIndex uint8) (pe *vnet.PortEntry) {
+	ifname := xeth.Ifname(msg.Ifname)
+	pe = vnet.SetPort(ifname.String())
+	pe.Net = msg.Net
+	pe.Ifindex = msg.Ifindex
+	pe.Iflinkindex = msg.Iflinkindex
+	pe.Ifname = ifname.String()
+	vnet.SetPortByIndex(msg.Ifindex, pe.Ifname)
+	pe.Iff = net.Flags(msg.Flags)
+	pe.Vid = msg.Id
+	copy(pe.Addr[:], msg.Addr[:])
+	pe.Portindex = msg.Portindex
+	// -1 is unspecified - from driver
+	if msg.Subportindex >= 0 {
+		pe.Subportindex = msg.Subportindex
+	}
+	pe.PuntIndex = puntIndex
+	pe.Devtype = msg.Devtype
+	return
+}
 
+func ProcessInterfaceInfo(msg *xeth.MsgIfinfo, action vnet.ActionType, v *vnet.Vnet, puntIndex uint8) (err error) {
+	if msg == nil {
+		sendFdbEventIfInfo(v)
+		return
+	}
 	switch action {
 	case vnet.PreVnetd:
-		ifname := xeth.Ifname(msg.Ifname)
-		pe := vnet.SetPort(ifname.String())
-		pe.Net = msg.Net
-		pe.Ifindex = msg.Ifindex
-		pe.Iflinkindex = msg.Iflinkindex
-		pe.Ifname = ifname.String()
-		vnet.SetPortByIndex(msg.Ifindex, pe.Ifname)
-		pe.Iff = xeth.Iff(msg.Flags)
-		pe.Vid = msg.Id
-		copy(pe.Addr[:], msg.Addr[:])
-		pe.Portindex = msg.Portindex
-		// -1 is unspecified - from driver
-		if msg.Subportindex >= 0 {
-			pe.Subportindex = msg.Subportindex
-		}
-		pe.PuntIndex = puntIndex
+		makePortEntry(msg, puntIndex)
 		if IfinfoDebug {
-			fmt.Println("XETH_MSG_KIND_IFINFO: Prevnetd:", ifname.String(), msg.Ifindex, msg.Portindex, msg.Subportindex, msg.Devtype, msg.Id)
+			fmt.Println("XETH_MSG_KIND_IFINFO: Prevnetd:", msg)
 		}
 
 	case vnet.ReadyVnetd:
@@ -758,42 +800,20 @@ func ProcessInterfaceInfo(msg *xeth.MsgIfinfo, action vnet.ActionType, v *vnet.V
 		if IfinfoDebug {
 			fmt.Println("ProcessInterfaceInfo: ReadyVnetd Add")
 		}
-		maybeAddNamespaces(v, 0)
 		// Signal that all namespaces are now initialized??
-		if true {
-			sendFdbEventIfInfo(v)
-		} else {
-			m := GetMain(v)
-			for _, pe := range vnet.Ports {
-				ns := getNsByInode(m, pe.Net)
-				if ns != nil {
-					if IfinfoDebug {
-						fmt.Println("ProcessInterfaceInfo-ReadyVnetd: Found namespace:", ns.name, pe.Ifname)
-					}
-					ns.addDelMk1Interface(m, false, pe.Ifname,
-						uint32(pe.Ifindex), pe.Addr)
-				} else {
-					if IfinfoDebug {
-						fmt.Println("ProcessInterfaceInfo - ReadyVnetd: no namespace for:", pe.Net, pe.Ifname)
-					}
-				}
-			}
-		}
+		sendFdbEventIfInfo(v)
 
 	case vnet.PostReadyVnetd:
 		fallthrough
 	case vnet.Dynamic:
-		ifname := xeth.Ifname(msg.Ifname)
+		ifname := (*xeth.Ifname)(&msg.Ifname).String()
+		ifindex := uint32(msg.Ifindex)
+		reason := xeth.IfinfoReason(msg.Reason)
+		netns := xeth.Netns(msg.Net)
 		if IfinfoDebug {
-			fmt.Println("XETH_MSG_KIND_IFINFO:", action, msg)
+			fmt.Println("XETH_MSG_KIND_IFINFO:", action, msg, ifname, netns)
 		}
-		// FIXME Add support for Dynamic cases known:
-		// - Addition of vlans or dummy interfaces (DO NOT SUPPORT dynamic addition of fp ports)
-		// - Need to cleanup old namespaces when no ports reference them
-		//
-		//
 		m := GetMain(v)
-		maybeAddNamespaces(v, msg.Net)
 		ns := getNsByInode(m, msg.Net)
 		if ns != nil {
 			if IfinfoDebug {
@@ -801,8 +821,18 @@ func ProcessInterfaceInfo(msg *xeth.MsgIfinfo, action vnet.ActionType, v *vnet.V
 			}
 			pe := vnet.GetPortByIndex(msg.Ifindex)
 			if pe == nil {
-				fmt.Println("XETH_MSG_KIND_IFINFO: pe is nil")
-				return
+				// If a vlan interface we allow dynamic creation so create a cached entry
+				if msg.Devtype >= xeth.XETH_DEVTYPE_LINUX_UNKNOWN {
+					if IfinfoDebug {
+						fmt.Println("Creating Ports entry for", ifname, msg.Ifindex, msg.Net)
+					}
+					pe = makePortEntry(msg, puntIndex)
+				} else {
+					if IfinfoDebug {
+						fmt.Println("XETH_MSG_KIND_IFINFO: pe is nil - returning")
+					}
+					return
+				}
 			}
 			if msg.Net != pe.Net {
 				// This ifindex has been set into a new namespace so
@@ -813,73 +843,86 @@ func ProcessInterfaceInfo(msg *xeth.MsgIfinfo, action vnet.ActionType, v *vnet.V
 					// old namespace already removed
 					fmt.Println("XETH_MSG_KIND_IFINFO-: Couldn't find old ns:", pe.Net)
 				} else {
-					nsOld.addDelMk1Interface(m, true, ifname.String(),
-						uint32(msg.Ifindex), msg.Addr)
+					nsOld.addDelMk1Interface(m, true, ifname,
+						uint32(msg.Ifindex), msg.Addr, msg.Devtype, msg.Iflinkindex, msg.Id)
 				}
 
-				ns.addDelMk1Interface(m, false, ifname.String(),
-					uint32(msg.Ifindex), msg.Addr)
+				ns.addDelMk1Interface(m, false, ifname,
+					uint32(msg.Ifindex), msg.Addr, msg.Devtype, msg.Iflinkindex, msg.Id)
 
 				if IfinfoDebug {
-					fmt.Println("XETH_MSG_KIND_IFINFO-Moving", ifname.String(), pe.Net, msg.Net)
+					fmt.Println("XETH_MSG_KIND_IFINFO-Moving", ifname, pe.Net, netns)
 				}
 				pe.Net = msg.Net
-			} else if msg.Net == pe.Net && action == vnet.PostReadyVnetd {
+			} else if action == vnet.PostReadyVnetd {
 				// Goes has restarted with interfaces already in existent namespaces,
 				// so create vnet representation of interface in this ns.
+				// Or this is a dynamically created vlan interface.
 				if IfinfoDebug {
-					fmt.Println("XETH_MSG_KIND_IFINFO - msg.Net == pe.Net", ifname.String(), msg.Net)
+					fmt.Println("XETH_MSG_KIND_IFINFO - msg.Net == pe.Net", ifname, netns)
 				}
-				ns.addDelMk1Interface(m, false, ifname.String(),
-					uint32(msg.Ifindex), msg.Addr)
+				ns.addDelMk1Interface(m, false, ifname,
+					uint32(msg.Ifindex), msg.Addr, msg.Devtype, msg.Iflinkindex, msg.Id)
+			} else if msg.Devtype >= xeth.XETH_DEVTYPE_LINUX_UNKNOWN {
+				// create or delete interfaces based on reg/unreg reason
+				if IfinfoDebug {
+					fmt.Println("XETH_MSG_KIND_IFINFO - Vlan msg.Net == pe.Net", ifname,
+						netns, reason)
+				}
+				ns.addDelMk1Interface(m, reason == xeth.XETH_IFINFO_REASON_UNREG, ifname,
+					uint32(msg.Ifindex), msg.Addr, msg.Devtype, msg.Iflinkindex, msg.Id)
+				if reason == xeth.XETH_IFINFO_REASON_UNREG {
+					return
+				}
 			}
-			ifindex := uint32(msg.Ifindex)
 			if ns.interface_by_index[ifindex] != nil {
 				// Process admin-state flags
 				if si, ok := ns.siForIfIndex(ifindex); ok {
 					ns.validateFibIndexForSi(si)
-					isUp := msg.Flags&xeth.IFF_UP == xeth.IFF_UP
+					flags := net.Flags(msg.Flags)
+					isUp := flags&net.FlagUp == net.FlagUp
 					err = si.SetAdminUp(v, isUp)
 					if err != nil {
 						fmt.Println("ProcessInterfaceInfo: admin up/down", err)
-					} else {
-						ifname := xeth.Ifname(msg.Ifname)
-						if IfinfoDebug {
-							fmt.Printf("ProcessInterfaceInfo: %s isUp %v flags (%s)\n",
-								ifname.String(), isUp, xeth.Iff(msg.Flags))
-						}
+					} else if IfinfoDebug {
+						fmt.Printf("ProcessInterfaceInfo: %q %s\n",
+							ifname, flags)
 					}
 				} else {
-					fmt.Println("ProcessInterfaceInfo: admin up/down: Can't get si!",
-						ifindex, ns.name)
+					fmt.Printf("ProcessInterfaceInfo: admin up/down: Can't get si! %q[%d] %s\n",
+						ifname, ifindex, ns.name)
 				}
 			} else {
-				// NB: This is the dynamic port-creation case which our lower layers
+				// NB: This is the dynamic front-panel-port-creation case which our lower layers
 				// don't support yet. Driver does not send us these but here as a placeholder.
-				if action == vnet.Dynamic {
-					ifname := xeth.Ifname(msg.Ifname)
-					_, found := vnet.Ports[ifname.String()]
-					if !found {
-						pe := vnet.SetPort(ifname.String())
-						if IfinfoDebug {
-							fmt.Println("ProcessInterfaceInfo: Setting into", ifname.String(),
-								pe.Net, msg.Net)
+				fmt.Println("ProcessInterfaceInfo: Attempting dynamic port-creation:", ifname)
+				if false {
+					if action == vnet.Dynamic {
+						_, found := vnet.Ports[ifname]
+						if !found {
+							pe := vnet.SetPort(ifname)
+							if IfinfoDebug {
+								fmt.Println("ProcessInterfaceInfo: Setting into", ifname,
+									pe.Net, msg.Net)
+							}
+							pe.Net = msg.Net
+							pe.Ifindex = msg.Ifindex
+							pe.Iflinkindex = msg.Iflinkindex
+							pe.Ifname = ifname
+							vnet.SetPortByIndex(msg.Ifindex, pe.Ifname)
+							pe.Iff = net.Flags(msg.Flags)
+							pe.Vid = msg.Id
+							copy(pe.Addr[:], msg.Addr[:])
+							pe.Portindex = msg.Portindex
+							pe.Subportindex = msg.Subportindex
+							pe.PuntIndex = puntIndex
 						}
-						pe.Net = msg.Net
-						pe.Ifindex = msg.Ifindex
-						pe.Iflinkindex = msg.Iflinkindex
-						pe.Ifname = ifname.String()
-						vnet.SetPortByIndex(msg.Ifindex, pe.Ifname)
-						pe.Iff = xeth.Iff(msg.Flags)
-						pe.Vid = msg.Id
-						copy(pe.Addr[:], msg.Addr[:])
-						pe.Portindex = msg.Portindex
-						pe.Subportindex = msg.Subportindex
-						pe.PuntIndex = puntIndex
 					}
+					ns.addDelMk1Interface(m, false, ifname,
+						uint32(msg.Ifindex), msg.Addr,
+						msg.Devtype, msg.Iflinkindex,
+						msg.Id)
 				}
-				ns.addDelMk1Interface(m, false, ifname.String(),
-					uint32(msg.Ifindex), msg.Addr)
 			}
 		} else {
 			if IfinfoDebug {
@@ -894,24 +937,23 @@ func sendFdbEventIfInfo(v *vnet.Vnet) {
 	m := GetMain(v)
 	fdbm := &m.FdbMain
 	fe := fdbm.GetEvent(vnet.PostReadyVnetd)
-	for _, pe := range vnet.Ports {
-		var ifname [16]uint8
-		copy(ifname[:], pe.Ifname)
+	xeth.Interface.Iterate(func(entry *xeth.InterfaceEntry) error {
 		if IfinfoDebug {
-			fmt.Println("sendFdbEventIfInfo:", pe.Ifname, pe)
+			fmt.Println("sendFdbEventIfInfo:", entry.Name)
 		}
 		buf := xeth.Pool.Get(xeth.SizeofMsgIfinfo)
 		msg := (*xeth.MsgIfinfo)(unsafe.Pointer(&buf[0]))
 		msg.Kind = xeth.XETH_MSG_KIND_IFINFO
-		msg.Ifname = ifname
-		msg.Ifindex = pe.Ifindex
-		msg.Iflinkindex = pe.Iflinkindex
-		msg.Addr = pe.Addr
-		msg.Net = pe.Net
-		msg.Portindex = pe.Portindex
-		msg.Subportindex = pe.Subportindex
-		msg.Flags = uint32(pe.Iff)
-		msg.Id = pe.Vid
+		copy(msg.Ifname[:], entry.Name)
+		msg.Ifindex = entry.Index
+		msg.Iflinkindex = entry.Link
+		copy(msg.Addr[:], entry.HardwareAddr())
+		msg.Net = uint64(entry.Netns)
+		msg.Id = entry.Id
+		msg.Portindex = entry.Port
+		msg.Subportindex = entry.Subport
+		msg.Flags = uint32(entry.Flags)
+		msg.Devtype = uint8(entry.DevType)
 		ok := fe.EnqueueMsg(buf)
 		if !ok {
 			// filled event with messages so send event and start a new one
@@ -922,7 +964,8 @@ func sendFdbEventIfInfo(v *vnet.Vnet) {
 				panic("sendFdbEventIfInfo: Re-enqueue of msg failed")
 			}
 		}
-	}
+		return nil
+	})
 	fe.Signal()
 }
 
@@ -932,4 +975,79 @@ func ipnetToUint(ipnet *net.IPNet, ipNotMask bool) uint32 {
 	} else {
 		return *(*uint32)(unsafe.Pointer(&ipnet.Mask[0]))
 	}
+}
+
+func InitInterfaceEthtool(v *vnet.Vnet) {
+	sendFdbEventEthtoolSettings(v)
+	sendFdbEventEthtoolFlags(v)
+}
+
+func sendFdbEventEthtoolSettings(v *vnet.Vnet) {
+	m := GetMain(v)
+	fdbm := &m.FdbMain
+	fe := fdbm.GetEvent(vnet.PostReadyVnetd)
+	for _, pe := range vnet.Ports {
+		xethif := xeth.Interface.Indexed(pe.Ifindex)
+		ifindex := xethif.Ifinfo.Index
+		ifname := xethif.Ifinfo.Name
+		if xethif.Ifinfo.DevType != xeth.XETH_DEVTYPE_XETH_PORT {
+			continue
+		}
+		if IfinfoDebug {
+			fmt.Println("sendFdbEventEthtoolSettings:", ifname, pe)
+		}
+		buf := xeth.Pool.Get(xeth.SizeofMsgEthtoolSettings)
+		msg := (*xeth.MsgEthtoolSettings)(unsafe.Pointer(&buf[0]))
+		msg.Kind = xeth.XETH_MSG_KIND_ETHTOOL_SETTINGS
+		msg.Ifindex = ifindex
+		msg.Speed = uint32(pe.Speed)
+		// xeth layer is cacheing the rest of this message
+		// in future can just reference that and send it along here
+		ok := fe.EnqueueMsg(buf)
+		if !ok {
+			// filled event with messages so send event and start a new one
+			fe.Signal()
+			fe = fdbm.GetEvent(vnet.PostReadyVnetd)
+			ok := fe.EnqueueMsg(buf)
+			if !ok {
+				panic("sendFdbEventEthtoolSettings: Re-enqueue of msg failed")
+			}
+		}
+	}
+	fe.Signal()
+}
+
+func sendFdbEventEthtoolFlags(v *vnet.Vnet) {
+	m := GetMain(v)
+	fdbm := &m.FdbMain
+	fe := fdbm.GetEvent(vnet.PostReadyVnetd)
+	for _, pe := range vnet.Ports {
+		xethif := xeth.Interface.Indexed(pe.Ifindex)
+		ifindex := xethif.Ifinfo.Index
+		ifname := xethif.Ifinfo.Name
+		if xethif.Ifinfo.DevType != xeth.XETH_DEVTYPE_XETH_PORT {
+			continue
+		}
+		if IfinfoDebug {
+			fmt.Println("sendFdbEventEthtoolFlags:", ifname, pe)
+		}
+		buf := xeth.Pool.Get(xeth.SizeofMsgEthtoolFlags)
+		msg := (*xeth.MsgEthtoolFlags)(unsafe.Pointer(&buf[0]))
+		msg.Kind = xeth.XETH_MSG_KIND_ETHTOOL_FLAGS
+		msg.Ifindex = ifindex
+		msg.Flags = uint32(pe.Flags)
+		// xeth layer is cacheing the rest of this message
+		// in future can just reference that and send it along here
+		ok := fe.EnqueueMsg(buf)
+		if !ok {
+			// filled event with messages so send event and start a new one
+			fe.Signal()
+			fe = fdbm.GetEvent(vnet.PostReadyVnetd)
+			ok := fe.EnqueueMsg(buf)
+			if !ok {
+				panic("sendFdbEventEthtoolFlags: Re-enqueue of msg failed")
+			}
+		}
+	}
+	fe.Signal()
 }
