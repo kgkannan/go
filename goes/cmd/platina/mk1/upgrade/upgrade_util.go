@@ -14,7 +14,6 @@ import (
 	"strings"
 	"syscall"
 
-	. "github.com/platinasystems/go"
 	"github.com/platinasystems/go/goes/cmd/platina/mk1/bootc"
 	"github.com/platinasystems/go/internal/url"
 )
@@ -110,7 +109,9 @@ func getGoesInfo() (im IMGINFO, err error) {
 	im.Fe1 = getGoesVal("tag", "/fe1")
 	im.Fe1Fw = getGoesVal("tag", "firmware-fe1a")
 	i := getGoesVal("version", "/go")
-	im.Commit = i[0:7]
+	if len(i) >= 8 {
+		im.Commit = i[0:7]
+	}
 	return im, nil
 }
 
@@ -245,6 +246,7 @@ func upgradeCoreboot(s string, v string, t bool, f bool) error {
 }
 
 func getGoesVal(ar string, ir string) (v string) {
+	/*FIXME
 	maps := []map[string]string{Package}
 	if Packages != nil {
 		maps = append(maps, Packages()...)
@@ -260,6 +262,8 @@ func getGoesVal(ar string, ir string) (v string) {
 		}
 	}
 	return v
+	*/
+	return "FIXME"
 }
 
 func getKernelVer() (string, error) {

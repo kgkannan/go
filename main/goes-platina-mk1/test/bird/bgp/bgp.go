@@ -44,6 +44,7 @@ func (bgp *bgp) Test(t *testing.T) {
 			bgp.checkInterConnectivity},
 		&test.Unit{"check flap", bgp.checkFlap},
 		&test.Unit{"check connectivity2", bgp.checkConnectivity},
+		&test.Unit{"check admin down", bgp.adminDown},
 	}
 	bgp.Docket.Test(t)
 }
@@ -73,7 +74,7 @@ func (bgp *bgp) checkBird(t *testing.T) {
 	assert := test.Assert{t}
 	time.Sleep(1 * time.Second)
 	for _, r := range bgp.Routers {
-		t.Logf("Checking BIRD on %v", r.Hostname)
+		assert.Comment("Checking BIRD on", r.Hostname)
 		out, err := bgp.ExecCmd(t, r.Hostname, "ps", "ax")
 		assert.Nil(err)
 		assert.Match(out, ".*bird.*")
@@ -195,4 +196,26 @@ func (bgp *bgp) checkFlap(t *testing.T) {
 			assert.Program(test.Self{}, "vnet", "show", "ip", "fib")
 		}
 	}
+}
+
+func (bgp *bgp) adminDown(t *testing.T) {
+	assert := test.Assert{t}
+
+	num_intf := 0
+	for _, r := range bgp.Routers {
+		for _, i := range r.Intfs {
+			var intf string
+			if i.Vlan != "" {
+				intf = i.Name + "." + i.Vlan
+			} else {
+				intf = i.Name
+			}
+			_, err := bgp.ExecCmd(t, r.Hostname,
+				"ip", "link", "set", "down", intf)
+			assert.Nil(err)
+			num_intf++
+		}
+	}
+	err := test.NoAdjacency(t)
+	assert.Nil(err)
 }

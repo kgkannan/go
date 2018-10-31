@@ -9,22 +9,14 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/platinasystems/fe1"
-	platinasystemsGo "github.com/platinasystems/go"
-	"github.com/platinasystems/go/internal/machine"
+	"github.com/platinasystems/go/platform/mk1"
 )
 
 const name = "platina-mk1"
 
 func main() {
-	var ecode int
-	machine.Name = name
-	platinasystemsGo.Packages = func() []map[string]string {
-		return fe1.Packages
-	}
-	if err := Goes.Main(os.Args...); err != nil {
+	if err := mk1.Start(name); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		ecode = 1
+		os.Exit(1)
 	}
-	os.Exit(ecode)
 }

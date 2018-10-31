@@ -45,6 +45,7 @@ func (ospf *ospf) Test(t *testing.T) {
 			ospf.checkInterConnectivity},
 		&test.Unit{"check flap", ospf.checkFlap},
 		&test.Unit{"check connectivity2", ospf.checkConnectivity},
+		&test.Unit{"admin down", ospf.adminDown},
 	}
 	ospf.Docket.Test(t)
 }
@@ -60,7 +61,8 @@ func (ospf *ospf) checkCarrier(t *testing.T) {
 			} else {
 				intf = i.Name
 			}
-			t.Logf("check carrier for %v on %v", r.Hostname, intf)
+			assert.Comment("check carrier for", r.Hostname,
+				"on", intf)
 			assert.Nil(test.Carrier(r.Hostname, intf))
 		}
 	}
@@ -91,7 +93,7 @@ func (ospf *ospf) checkFrr(t *testing.T) {
 	assert := test.Assert{t}
 
 	for _, r := range ospf.Routers {
-		t.Logf("Checking FRR on %v", r.Hostname)
+		assert.Comment("Checking FRR on", r.Hostname)
 		out, err := ospf.ExecCmd(t, r.Hostname, "ps", "ax")
 		assert.Nil(err)
 		assert.Match(out, ".*ospfd.*")
@@ -214,4 +216,26 @@ func (ospf *ospf) checkFlap(t *testing.T) {
 			assert.Program(test.Self{}, "vnet", "show", "ip", "fib")
 		}
 	}
+}
+
+func (ospf *ospf) adminDown(t *testing.T) {
+	assert := test.Assert{t}
+
+	num_intf := 0
+	for _, r := range ospf.Routers {
+		for _, i := range r.Intfs {
+			var intf string
+			if i.Vlan != "" {
+				intf = i.Name + "." + i.Vlan
+			} else {
+				intf = i.Name
+			}
+			_, err := ospf.ExecCmd(t, r.Hostname,
+				"ip", "link", "set", "down", intf)
+			assert.Nil(err)
+			num_intf++
+		}
+	}
+	err := test.NoAdjacency(t)
+	assert.Nil(err)
 }
